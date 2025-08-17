@@ -27,7 +27,7 @@ A small, extendable Kubernetes pentest toolkit for AppSec audits written by AI, 
 4. Make executable: `chmod +x ONRE_Toolkit_k8s.py`
 
 ## Usage
-Run the script: `./ONRE_Toolkit_k8s.py` or `python3 ONRE_Toolkit_k8s.py`
+Run the script: `./ONRE_Toolkit_k8s.py` or `python3 ONRE_Toolkit_k8s.py` or run sh version `./ONRE_Toolkit_k8s.sh`
 - Select commands from the menu.
 - Use responsibly in authorized test environments only.
 
