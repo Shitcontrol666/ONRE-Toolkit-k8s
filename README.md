@@ -1,6 +1,6 @@
 # k8s-pentest-framework
 
-A small, extendable Kubernetes pentest toolkit for AppSec audits.
+A small, extendable Kubernetes pentest toolkit for AppSec audits written by AI, for fast security checks mentioned in kubernetes goat.
 
 ## Features
 - Pod to node privileged pod generator
