@@ -11,8 +11,8 @@ A small, extendable Kubernetes pentest toolkit for AppSec audits written by AI, 
 - Environment information gathering from pods
 - Registry scanner with /v2/_catalog check for auth
 - Namespace bypass check
-- Spawn shell and return to menu
 - Core components check (apiserver flags, etcd no-TLS, kubelet anon access, etcdctl access)
+- Spawn shell and return to menu
 
 ## Installation
 1. Ensure Python 3 is installed.
@@ -23,11 +23,11 @@ A small, extendable Kubernetes pentest toolkit for AppSec audits written by AI, 
      - curl
      - nmap (for NodePort scanning)
      - etcdctl (for etcd access check)
-3. Download the script: `curl -O https://raw.githubusercontent.com/ONRE-Toolkit-k8s/main/onre_k8s_framework.py`
-4. Make executable: `chmod +x onre_k8s_framework.py`
+3. Download the script: `curl -O [https://raw.githubusercontent.com/ONRE-Toolkit-k8s/main/onre_k8s_framework.py](https://raw.githubusercontent.com/Shitcontrol666/ONRE-Toolkit-k8s/refs/heads/main/ONRE_Toolkit_k8s.py)`
+4. Make executable: `chmod +x ONRE_Toolkit_k8s.py`
 
 ## Usage
-Run the script: `./onre_k8s_framework.py` or `python3 onre_k8s_framework.py`
+Run the script: `./ONRE_Toolkit_k8s.py` or `python3 ONRE_Toolkit_k8s.py`
 - Select commands from the menu.
 - Use responsibly in authorized test environments only.
 
