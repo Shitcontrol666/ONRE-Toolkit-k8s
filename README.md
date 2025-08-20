@@ -34,7 +34,7 @@ pip install -r requirements.txt
 ```
 
 ## Installation
-1. Clone or download the script (`1.py` or rename to `onre.py`).
+1. Clone or download the script.
 2. Install requirements:
    ```
    pip install -r requirements.txt
@@ -44,7 +44,8 @@ pip install -r requirements.txt
 ## Usage
 Run the script in a terminal with `kubectl` access:
 ```
-python3 onre.py
+python3 ONRE_Toolkit_k8s.py
+bash ONRE_Toolkit_k8s.sh
 ```
 - A banner and menu will appear.
 - Select options by number or command name (e.g., `4` or `ingress`).
